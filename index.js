@@ -1,192 +1,260 @@
-var CPU = require("./system/cpu");
-var APU = require("./system/apu");
-var PPU = require("./system/ppu");
-var Cartridge = require("./system/cartridge");
-var Controllers = require("./system/controllers");
-var Output = require("./system/output");
-var Memory = require("./system/memory");
-var utils = require("./utils");
-var Input = require("./system/input");
+"use strict";
 
-var config = require("./config.json");
+var Pulse = require("./pulse");
+var Triangle = require("./triangle");
+var Noise = require("./noise");
+var DMC = require("./dmc");
 
-function System( el ) {
-	this.config = config;
+function APU( system ) {
+	this.system = system;
+	this.output = system.output.audio;
 
-	// system timing flags
-	this.frameEnded = false;
-	this.tickAPU = false;
+	this.sampleCounter = 0;
+	this.sampleCounterMax = ( 1789773 / 2 / this.output.sampleRate ); // TODO, this is NTSC-only
 
-	// IO
-	this.controllers = new Controllers();
-	this.input = new Input( this );
-	this.output = new Output();
+	this.frameCounterMode = 0;
+	this.frameCounterInterrupt = false;
+	this.frameCount = 0;
 
-	// video output
-	if ( el ) {
-		this.output.video.setElement( el );
-	}
+	this.cycles = 0;
 
-	// reserve for timing
-	this.interval = null;
-	this.running = false;
-	this.paused = true;
-
-	// reserve for system core
-	this.cartridge = null;
-	this.cpu = null;
-	this.apu = null;
-	this.ppu = null;
-	this.memory = null;
+	this.pulse1 = new Pulse();
+	this.pulse2 = new Pulse();
+	this.triangle = new Triangle();
+	this.noise = new Noise();
+	this.dmc = new DMC( this );
 
 	Object.preventExtensions( this );
 }
 
-System.prototype = {
+APU.prototype = {
 	/**
-	 * Load a ROM and optionally run it.
-	 * @param {string} filename - Path of ROM to run.
-	 * @param autorun - If true, run ROM when loaded. If a function, call that function.
-	 */
-	load: function( filename, autorun ) {
-		var self = this;
-
-		utils.readFile( filename, function( data ) {
-			self.initCartridge( data );
-
-			if ( typeof autorun === "function" ) {
-				autorun();
-			} else if ( autorun === true ) {
-				self.run();
-			}
-		});
-	},
-
-	/**
-	 * Turn on and run emulator.
-	 */
-	run: function() {
-		if ( this.interval ) {
-			// once is enough
-			return;
-		}
-
-		var self = this;
-		this.interval = setInterval( function() {
-			if ( !self.paused) {
-				self.runFrame();
-			}
-		}, 1000 / 60 );
-
-		this.output.video.run();
-
-		this.running = true;
-		this.paused = false;
-	},
-
-	/**
-	 * Run a single frame (1/60s NTCS, 1/50s PAL).
-	 */
-	runFrame: function() {
-		var cpu = this.cpu,
-		    ppu = this.ppu,
-		    apu = this.apu;
-
-		while ( !ppu.frameEnded ) {
-			cpu.tick();
-
-			ppu.tick();
-			ppu.tick();
-			ppu.tick();
-
-			if ( this.tickAPU ) {
-				apu.tick();
-			}
-			this.tickAPU = !this.tickAPU;
-		}
-
-		ppu.frameEnded = false;
-	},
-
-	/**
-	 * Synchronously simulate running for a number of milliseconds.
-	 * @param {number} milliseconds - The number of milliseconds to simulate.
-	 */
-	simulate: function( milliseconds ) {
-		var i,
-		    frames = ( milliseconds / 1000 ) * 60;
-
-		for ( i = 0; i < frames; i++ ) {
-			this.runFrame();
-		}
-	},
-
-	/**
-	 * Resume running.
-	 */
-	play: function() {
-		this.paused = false;
-
-		if ( !this.running ) {
-			this.run();
-		}
-	},
-
-	/**
-	 * Stop running.
-	 */
-	pause: function() {
-		this.paused = true;
-	},
-
-	/**
-	 * On/off switch.
-	 */
-	toggle: function() {
-		if ( this.paused ) {
-			this.play();
-		} else {
-			this.pause();
-		}
-
-		return this.paused;
-	},
-
-	/**
-	 * Initialize cartridge and hook into system.
-	 */
-	initCartridge: function( data ) {
-		this.cartridge = new Cartridge( data, this );
-	
-		this.initCore();
-		this.reset();
-	},
-
-	loadCartridge: function( cartridge ) {
-		//this.cartridge = cartridge;
-		this.memory.loadCartridge( cartridge );
-		this.ppu.memory.loadCartridge( cartridge );
-	},
-
-	/**
-	 * Initialize the core of our emulator (processor etc).
-	 */
-	initCore: function() {
-		this.cpu = new CPU( this );
-		this.apu = new APU( this );
-		this.ppu = new PPU( this );
-		this.memory = new Memory( this );
-
-		this.loadCartridge( this.cartridge );
-	},
-
-	/**
-	 * Reset the console.
+	 * Handle system reset.
 	 */
 	reset: function() {
-		this.cpu.reset();
-		this.apu.reset();
+		this.writeStatus( 0x0 );
+	},
+
+	/**
+	 * Read APU registers.
+	 * The APU only has a single readable register: 0x4015.
+	 */
+	readRegister: function( address ) {
+		if ( address === 0x15 ) {
+			return this.readStatus();
+		}
+
+		return 0;
+	},
+
+	/**
+	 * Read channel status.
+	 */
+	readStatus: function() {
+		return (
+			( (!!this.pulse1.lengthCounter) << 0 ) |
+			( (!!this.pulse2.lengthCounter) << 1 ) |
+			( (!!this.triangle.lengthCounter) << 2 ) |
+			( (!!this.noise.lengthCounter) << 3 ) |
+			( (!!this.dmc.sampleBytesLeft) << 4 )
+		);
+	},
+
+	/**
+	 * Write to APU registers.
+	 */
+	writeRegister: function( address, value ) {
+		if ( address < 0x4 ) {
+			// pulse 1 registers
+			this.pulse1.writeRegister( address, value );
+		} else if ( address < 0x8 ) {
+			// pulse 2 registers
+			this.pulse2.writeRegister( address - 0x4, value );
+		} else if ( address < 0xc ) {
+			// triangle registers
+			this.triangle.writeRegister( address - 0x8, value );
+		} else if ( address < 0x10 ) {
+			// noise registers
+			this.noise.writeRegister( address - 0xc, value );
+		} else if ( address < 0x14 ) {
+			// DMC registers
+			this.dmc.writeRegister( address - 0x10, value );
+		} else if ( address === 0x15 ) {
+			// enabling / disabling channels
+			this.writeStatus( value );
+		} else if ( address === 0x17 ) {
+			// set framecounter mode
+
+			this.frameCounterMode = +!!(value & 0x80);
+			this.frameCounterInterrupt = !( value & 0x40 );
+
+			this.cycles = 0;
+			// TODO:
+			// If the write occurs during an APU cycle, the effects occur 3 CPU cycles
+			// after the $4017 write cycle, and if the write occurs between APU cycles,
+			// the effects occurs 4 CPU cycles after the write cycle.
+
+			if ( this.frameCounterMode ) {
+				// Writing to $4017 with bit 7 set will immediately generate a clock for
+				// both the quarter frame and the half frame units, regardless of what
+				// the sequencer is doing.
+
+				this.doQuarterFrame();
+				this.doHalfFrame();
+			}
+
+		}
+	},
+
+	/**
+	 * Enabled and/or disabled channels.
+	 */
+	writeStatus: function( value ) {
+		this.pulse1.toggle( value & 1 );
+		this.pulse2.toggle( value & 2 );
+		this.triangle.toggle( value & 4 );
+		this.noise.toggle( value & 8 );
+	},
+
+	/**
+	 * Do a single APU tick.
+	 */
+	tick: function() {
+		switch( this.frameCounterMode ) {
+		case 0:
+			this.tick0();
+			break;
+		default:
+			this.tick1();
+		}
+
+		this.cycles += 1;
+
+		this.updateSample();
+
+		return;		
+	},
+
+	/**
+	 * Tick for framecounter mode 0.
+	 */
+	tick0: function() {
+		switch( this.cycles ) {
+		case 3728:
+		case 7457:
+		case 11186:
+		case 14915:
+			this.doQuarterFrame();
+			break;
+		}
+
+		switch( this.cycles ) {
+		case 7457:
+		case 14915:
+			this.doHalfFrame();
+			break;
+		}
+
+		if ( this.cycles >= 14915 ) {
+			this.cycles = 0;
+
+			if( this.frameCounterInterrupt ) {
+				this.system.cpu.requestIRQ();
+			}
+		}
+	},
+
+	/**
+	 * Tick for framecounter mode 1.
+	 */
+	tick1: function() {
+		switch( this.cycles ) {
+		case 3729:
+		case 7457:
+		case 11186:
+		case 18641:
+			this.doQuarterFrame();
+			break;
+		}
+
+		switch( this.cycles ) {
+		case 7457:
+		case 18641:
+			this.doHalfFrame();
+			break;
+		}
+
+		if ( this.cycles >= 18641 ) {
+			this.cycles = 0;
+		}
+	},
+
+	/**
+	 * Do quarter frame tick (envelopes and linear counter).
+	 */
+	doQuarterFrame: function() {
+		this.pulse1.doEnvelope();
+		this.pulse2.doEnvelope();
+		this.noise.doEnvelope();
+		this.triangle.doLinearCounter();
+	},
+
+	/**
+	 * Do half frame tick (sweeps and length counters).
+	 */
+	doHalfFrame: function() {
+		this.pulse1.doSweep();
+		this.pulse1.doLengthCounter();
+
+		this.pulse2.doSweep();
+		this.pulse2.doLengthCounter();
+
+		this.triangle.doLengthCounter();
+
+		this.noise.doLengthCounter();
+		// TODO
+	},
+
+	/**
+	 * Update output sample.
+	 */
+	updateSample: function() {
+		var tndOut = 0, // triangle, noise, dmc
+			pulseOut = 0;
+
+		this.pulse1.doTimer();
+		this.pulse2.doTimer();
+		this.triangle.doTimer();
+		this.noise.doTimer();
+		this.dmc.doTimer();
+
+		if ( this.output.enabled ) {
+			// no need to do calculations if output is disabled
+			if ( this.sampleCounter >= this.sampleCounterMax ) {
+				pulseOut =  pulseTable[ this.pulse1.sample + this.pulse2.sample ];
+				tndOut = tndTable[ 3 * this.triangle.sample + 2 * this.noise.sample + this.dmc.sample ];
+
+				this.output.writeSample( pulseOut + tndOut );
+
+				this.sampleCounter -= this.sampleCounterMax;
+			}
+
+			this.sampleCounter += 1;
+		}
 	}
 };
 
-module.exports = System;
+/**
+ * Calculate lookup tables for audio samples.
+ */
+var i = 0;
+var pulseTable = new Float32Array( 31 );
+for ( i = 0; i < 31; i++ ) {
+	pulseTable[ i ] = 95.52 / ( 8128.0 / i + 100 );
+}
+var tndTable = new Float32Array( 203 );
+for ( i = 0; i < 203; i++ ) {
+	tndTable[ i ] = 163.67 / (24329.0 / i + 100);
+}
+
+module.exports = APU;

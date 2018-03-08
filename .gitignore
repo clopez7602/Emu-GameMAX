@@ -1,4 +1,1 @@
-*.log
-*.swp
-node_modules
-dist
+nesnes.js

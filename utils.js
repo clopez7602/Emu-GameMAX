@@ -1,16 +1,15 @@
-var fs = require("fs");
-
-/**
- * Wrapper around fs.readFile to make it easily replaceble by Browserify and to
- * handle converting to an ArrayBuffer in a single place.
- */
 exports.readFile = function( filename, callback ) {
-	fs.readFile( filename, function( err, data ) {
-		if ( err ) {
-			throw err;
-		}
+	var xhr = new XMLHttpRequest();
+	xhr.open( "GET", filename );
+	xhr.responseType = "arraybuffer";
 
-		var buffer = new Uint8Array( data ).buffer;
-		callback( buffer );
-	});
+	xhr.onload = function() {
+		callback( xhr.response );
+	};
+
+	xhr.onerror = function( e ) {
+		throw e;
+	};
+
+	xhr.send( null );
 };
